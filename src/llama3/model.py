@@ -9,53 +9,36 @@ from torch.nn import functional as F
 # --------------------------------------------------------------
 
 
-class RotaryPositionEmbedding(nn.Module):
-    def __init__(self, head_dim, max_seq_len=8192, theta=500_000):
-        super().__init__()
-        self.head_dim = head_dim
+# --------------------------------------------------------------
+# RoPE functions rather than in class, so i can reuse cos and sin
+def precompute_rope(head_dim, max_seq_len, theta):
+    # RoPE operates on pairs of dimensions, so we calc frequencies for half the head_dim
+    inv_freq = 1.0 / (theta ** (torch.arange(0, head_dim, 2).float() / head_dim))
 
-        # RoPE operates on pairs of dimensions, so we calc frequencies for half the head_dim
-        inv_freq = 1.0 / (theta ** (torch.arange(0, head_dim, 2).float() / head_dim))
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
+    # precompute the cos and sin freq ip to max_seq_len
+    t = torch.arange(max_seq_len, dtype=torch.float32)
+    freqss = torch.outer(t, inv_freq)
 
-        # precompute the cos and sin freq ip to max_seq_len
-        t = torch.arange(max_seq_len, dtype=torch.float32)
-        freqss = torch.outer(t, self.inv_freq)
+    # duplicate each frequency to match head dim
+    emb = torch.cat((freqss, freqss), dim=1)
 
-        # duplicate each frequency to match head dim
-        emb = torch.cat((freqss, freqss), dim=1)
-
-        # Cache cos and sin as [1, 1, max_seq_len, head_dim]
-        self.register_buffer(
-            "cos_cached", emb.cos()[None, None, :, :], persistent=False
-        )
-        self.register_buffer(
-            "sin_cached", emb.sin()[None, None, :, :], persistent=False
-        )
-
-    def _rotate_half(self, x):
-        """
-        split tensor in half along last dim and rotates one half
-        """
-        x1 = x[..., : self.head_dim // 2]
-        x2 = x[..., self.head_dim // 2 :]
-        return torch.cat((-x2, x1), dim=-1)
-
-    def forward(self, q, k, seq_len):
-        # slice the precomputed cache to match the current seq length
-        cos = self.cos_cached[:, :, :seq_len, :]  # (1,1,seq_len,head_dim)
-        sin = self.sin_cached[:, :, :seq_len, :]  # (1,1,seq_len,head_dim)
-
-        # apply rotation formula
-        q_rotated = (q * cos) + (self._rotate_half(q) * sin)
-        k_rotated = (k * cos) + (self._rotate_half(k) * sin)
-
-        return q_rotated, k_rotated
+    return emb.cos(), emb.sin()
 
 
+def rotate_half(x):
+    x1, x2 = x.chunk(2, dim=-1)
+    return torch.cat((-x2, x1), dim=-1)
+
+
+def apply_rope(x, cos, sin):
+    # broadcast: (T, head_dim) -> (B, nh, T, head_dim)
+    return x * cos + rotate_half(x) * sin
+
+
+# --------------------------------------------------------------
 class SwiGLU(nn.Module):
     """
-    SWiGLU implementation, SwiGLU(x) = (xW1) * SiLU(xW2)
+    SWiGLU implementation, SwiGLU(x) = (xW2) * SiLU(xW1)
     """
 
     def __init__(self, d_model, hidden_dim):
@@ -63,7 +46,7 @@ class SwiGLU(nn.Module):
 
         self.w1 = nn.Linear(d_model, hidden_dim, bias=False)
         self.w2 = nn.Linear(d_model, hidden_dim, bias=False)
-        self.w3 = nn.Linear(hidden_dim, d_model)
+        self.w3 = nn.Linear(hidden_dim, d_model, bias=False)
         self.w3._is_residual = True
 
     def forward(self, x):
@@ -79,7 +62,7 @@ class RMSNorm(nn.Module):
     def __init__(self, config):
         super().__init__()
 
-        self.rmsnorm = nn.RMSNorm(normalized_shape=(config.n_embd,))
+        self.rmsnorm = nn.RMSNorm(normalized_shape=(config.n_embd,), eps=config.eps)
 
     def forward(self, x):
         return self.rmsnorm(x)
@@ -99,57 +82,6 @@ class MLP(nn.Module):
         return self.swiglu(x)
 
 
-class CausalSelfAttention(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-
-        # k,q,v proj
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
-        # output proj
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd)
-
-        self.n_head = config.n_head
-        self.n_embd = config.n_embd
-
-        # RoPE
-        self.rope = RotaryPositionEmbedding(
-            self.n_embd // self.n_head, theta=config.theta
-        )
-
-        # the mask for causality
-        self.register_buffer(
-            "bias",
-            torch.tril(torch.ones(config.block_size, config.block_size)).view(
-                1, 1, config.block_size, config.block_size
-            ),
-        )
-
-    def forward(self, x):
-        B, T, C = x.size()
-        # get qkv
-        qkv = self.c_attn(x)
-        q, k, v = qkv.split(self.n_embd, dim=-1)
-
-        # nh no of heads and hs is head size and C is number of channels
-        # k,q,v have shape (B, nh, T, hs)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
-
-        # RoPE
-        q, k = self.rope(q, k, T)
-
-        # attention
-        # att size (B, nh, T, T)
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))
-        att = F.softmax(att, dim=-1)
-        y = att @ v
-        y = y.transpose(1, 2).contiguous().view(B, T, C)
-        y = self.c_proj(y)
-        return y
-
-
 class GroupedQueryAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -161,13 +93,11 @@ class GroupedQueryAttention(nn.Module):
 
         assert self.n_heads % self.n_groups == 0, "n_head must be divisible by n_groups"
 
-        self.q_proj = nn.Linear(self.d_model, self.n_heads * self.head_dim)
-        self.k_proj = nn.Linear(self.d_model, self.n_groups * self.head_dim)
-        self.v_proj = nn.Linear(self.d_model, self.n_groups * self.head_dim)
-        self.out_proj = nn.Linear(self.d_model, self.d_model)
+        self.q_proj = nn.Linear(self.d_model, self.n_heads * self.head_dim, bias=False)
+        self.k_proj = nn.Linear(self.d_model, self.n_groups * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(self.d_model, self.n_groups * self.head_dim, bias=False)
+        self.out_proj = nn.Linear(self.d_model, self.d_model, bias=False)
         self.out_proj._is_residual = True
-
-        self.rope = RotaryPositionEmbedding(self.head_dim, theta=config.theta)
 
         # Causal mask: lower triangular is 1, upper is 0
         self.register_buffer(
@@ -177,27 +107,33 @@ class GroupedQueryAttention(nn.Module):
             ),
         )
 
-    def forward(self, x):
+    def forward(self, x, cos, sin):
         B, T, C = x.size()
 
         # Project queries, keys, and values -> (B, num_heads, T, head_dim)
         q = self.q_proj(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+        # k, v share heads within a group: (B, n_groups, T, head_dim)
         k = self.k_proj(x).view(B, T, self.n_groups, self.head_dim).transpose(1, 2)
         v = self.v_proj(x).view(B, T, self.n_groups, self.head_dim).transpose(1, 2)
 
         # RoPE
-        q, k = self.rope(q, k, T)
+        q = apply_rope(q, cos, sin)
+        k = apply_rope(k, cos, sin)
 
         # Expand K and V heads to match Q heads along head dimension
+        # (B, n_groups, T, head_dim) -> (B, n_heads, T, head_dim)
         k = k.repeat_interleave(self.group_size, dim=1)
         v = v.repeat_interleave(self.group_size, dim=1)
 
         # Scaled dot-product attention
+        # (B, n_heads, T, head_dim) @ (B, n_heads, head_dim, T) -> (B, n_heads, T, T)
         scores = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        # broadcast: (1, 1, T, T) -> (B, n_heads, T, T)
         attn = scores.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))
         attn = F.softmax(attn, dim=-1)
 
         # Aggregate values and restore dimensions
+        # (B, n_heads, T, head_dim) -> (B, T, C)
         y = attn @ v
         y = y.transpose(1, 2).contiguous().view(B, T, C)
 
@@ -212,8 +148,8 @@ class Block(nn.Module):
         self.rms_2 = RMSNorm(config=config)
         self.mlp = MLP(config)
 
-    def forward(self, x):
-        x = x + self.attn(self.rms_1(x))
+    def forward(self, x, cos, sin):
+        x = x + self.attn(self.rms_1(x), cos, sin)
         x = x + self.mlp(self.rms_2(x))
         return x
 
@@ -234,6 +170,12 @@ class LLaMA3(nn.Module):
 
         # weight sharing (diverging from the Meta for efficiency for my own compute)
         self.transformer.wte.weight = self.lm_head.weight
+
+        # precalculate the rope sin and cos
+        head_dim = config.n_embd // config.n_head
+        cos, sin = precompute_rope(head_dim, config.block_size, config.theta)
+        self.register_buffer("rope_cos", cos, persistent=False)
+        self.register_buffer("rope_sin", sin, persistent=False)
 
         # initialise weights with Kaiming Init
         self.apply(self._init_weights)
@@ -265,10 +207,12 @@ class LLaMA3(nn.Module):
         tok_emb = self.transformer.wte(idx)
         x = tok_emb
 
+        cos, sin = self.rope_cos[:T], self.rope_sin[:T]
         for block in self.transformer.h:
-            x = block(x)
+            x = block(x, cos, sin)
 
         x = self.transformer.rms_f(x)
+        # (B, T, n_embd) -> (B, T, vocab_size)
         logits = self.lm_head(x)
         loss = None
         if targets is not None:
