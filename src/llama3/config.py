@@ -8,7 +8,7 @@ class TrainConfig:
     # run / io
     run_name: str = "test"
     runs_root: str = "runs"  # on RunPod: /workspace/runs (network volume)
-    data_path: str = "input.txt"
+    data_path: str = "data/input.txt"
     resume: bool = False
 
     # batch
@@ -74,13 +74,15 @@ def parse_configs(*classes):
         for f in fields(cls):
             assert f.name not in seen, f"duplicate config field: {f.name}"
 
-        seen.add(f.name)
-        if f.type is bool:
-            parser.add_argument(
-                f"--{f.name}", action=argparse.BooleanOptionalAction, default=f.default
-            )
-        else:
-            parser.add_argument(f"--{f.name}", type=f.type, default=f.default)
+            seen.add(f.name)
+            if f.type is bool:
+                parser.add_argument(
+                    f"--{f.name}",
+                    action=argparse.BooleanOptionalAction,
+                    default=f.default,
+                )
+            else:
+                parser.add_argument(f"--{f.name}", type=f.type, default=f.default)
 
     args = vars(parser.parse_args())
     return [cls(**{f.name: args[f.name] for f in fields(cls)}) for cls in classes]

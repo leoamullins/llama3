@@ -57,7 +57,11 @@ if master_process:
 
 
 train_loader = DataLoaderLite(
-    B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size
+    B=B,
+    T=T,
+    process_rank=ddp_rank,
+    num_processes=ddp_world_size,
+    data_path=train_cfg.data_path,
 )
 
 torch.set_float32_matmul_precision("high")
@@ -106,13 +110,13 @@ for step in range(max_steps):
         x, y = train_loader.next_batch()
         x, y = x.to(device), y.to(device)
 
-        with torch.autocast(device_type=device, dtype=torch.bfloat16):
+        with torch.amp.autocast(device_type=device, dtype=torch.bfloat16):
             logits, loss = model(x, y)
 
         loss = loss / grad_accum_steps
         loss_accum += loss.detach()
         if ddp:
-            model.requires_backward_grad_sync = micro_step == grad_accum_steps - 1
+            model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
         loss.backward()
     if ddp:
         dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
