@@ -8,7 +8,7 @@ class TrainConfig:
     # run / io
     run_name: str = "test"
     runs_root: str = "runs"  # on RunPod: /workspace/runs (network volume)
-    data_path: str = "data/input.txt"
+    data_path: str = "edu_fineweb10B"  # directory of train and val .npy shards
     resume: bool = False
 
     # batch
@@ -65,6 +65,7 @@ class LlamaConfig:
     n_groups: int = 4  # KV heads; = n_head gives plain multi-head attention
     theta: float = 10_000.0  # RoPE base
     eps: float = 1e-5  # RMSNorm epsilon
+    sdpa: bool = True  # F.scaled_dot_product_attention; --no-sdpa for the manual path
 
 
 def parse_configs(*classes):

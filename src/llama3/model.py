@@ -91,6 +91,7 @@ class GroupedQueryAttention(nn.Module):
         self.n_groups = config.n_groups
         self.group_size = self.n_heads // self.n_groups
         self.head_dim = self.d_model // self.n_heads
+        self.sdpa = config.sdpa
 
         assert self.n_heads % self.n_groups == 0, "n_head must be divisible by n_groups"
 
@@ -101,6 +102,7 @@ class GroupedQueryAttention(nn.Module):
         self.out_proj._is_residual = True
 
         # Causal mask: lower triangular is 1, upper is 0
+        # registered even with sdpa, so checkpoints load under either setting
         self.register_buffer(
             "bias",
             torch.tril(torch.ones(config.block_size, config.block_size)).view(
@@ -126,16 +128,19 @@ class GroupedQueryAttention(nn.Module):
         k = k.repeat_interleave(self.group_size, dim=1)
         v = v.repeat_interleave(self.group_size, dim=1)
 
-        # Scaled dot-product attention
-        # (B, n_heads, T, head_dim) @ (B, n_heads, head_dim, T) -> (B, n_heads, T, T)
-        scores = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
-        # broadcast: (1, 1, T, T) -> (B, n_heads, T, T)
-        attn = scores.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))
-        attn = F.softmax(attn, dim=-1)
+        if self.sdpa:
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        else:
+            # Scaled dot-product attention
+            # (B, n_heads, T, head_dim) @ (B, n_heads, head_dim, T) -> (B, n_heads, T, T)
+            scores = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+            # broadcast: (1, 1, T, T) -> (B, n_heads, T, T)
+            attn = scores.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))
+            attn = F.softmax(attn, dim=-1)
+            y = attn @ v
 
-        # Aggregate values and restore dimensions
+        # Restore dimensions
         # (B, n_heads, T, head_dim) -> (B, T, C)
-        y = attn @ v
         y = y.transpose(1, 2).contiguous().view(B, T, C)
 
         return self.out_proj(y)

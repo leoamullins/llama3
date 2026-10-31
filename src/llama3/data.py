@@ -12,7 +12,7 @@ def load_tokens(filename):
 
 
 class DataLoaderFineWeb:
-    def __init__(self, B, T, process_rank, num_processes, split):
+    def __init__(self, B, T, process_rank, num_processes, data_path, split="train"):
         self.B = B
         self.T = T
         self.process_rank = process_rank
@@ -20,11 +20,10 @@ class DataLoaderFineWeb:
         assert split in {"train", "val"}
 
         # get the shard filenames
-        data_root = "edu_fineweb10B"
-        shards = os.listdir(data_root)
+        shards = os.listdir(data_path)
         shards = [s for s in shards if split in s]
         shards = sorted(shards)
-        shards = [os.path.join(data_root, s) for s in shards]
+        shards = [os.path.join(data_path, s) for s in shards]
         self.shards = shards
         assert len(shards) > 0, f"no shards found for split {split}"
         if process_rank == 0:
@@ -37,6 +36,19 @@ class DataLoaderFineWeb:
         self.tokens = load_tokens(self.shards[self.current_shard])
         self.current_position = self.B * self.T * self.process_rank
 
+    def state_dict(self):
+        # position relative to this rank's offset, so it's the same on every rank
+        rank_offset = self.B * self.T * self.process_rank
+        return {
+            "shard": self.current_shard,
+            "position": self.current_position - rank_offset,
+        }
+
+    def load_state_dict(self, state):
+        self.current_shard = state["shard"]
+        self.tokens = load_tokens(self.shards[self.current_shard])
+        self.current_position = state["position"] + self.B * self.T * self.process_rank
+
     def next_batch(self):
         B, T = self.B, self.T
         buf = self.tokens[self.current_position : self.current_position + B * T + 1]
@@ -45,7 +57,9 @@ class DataLoaderFineWeb:
         # advance the position in the tensor
         self.current_position += B * T * self.num_processes
         # if loading the next batch would be out of bounds, advance to next shard
-        if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
+        # measured from rank 0's position so that all ranks move on together
+        rank_0_position = self.current_position - B * T * self.process_rank
+        if rank_0_position + (B * T * self.num_processes + 1) > len(self.tokens):
             self.current_shard = (self.current_shard + 1) % len(self.shards)
             self.tokens = load_tokens(self.shards[self.current_shard])
             self.current_position = B * T * self.process_rank
@@ -56,21 +70,38 @@ import tiktoken
 
 
 class DataLoaderLite:
-    def __init__(self, B, T, process_rank, num_processes, data_path):
+    def __init__(self, B, T, process_rank, num_processes, data_path, split="train"):
         self.B = B
         self.T = T
         self.process_rank = process_rank
         self.num_processes = num_processes
+        assert split in {"train", "val"}
 
         with open(data_path, "r") as f:
             text = f.read()
         enc = tiktoken.get_encoding("gpt2")
-        tokens = enc.encode(text)
-        self.tokens = torch.tensor(tokens)
-        print(f"Loaded {len(self.tokens)} tokens.")
+        tokens = torch.tensor(enc.encode(text))
+        # first 90% is train, last 10% is val
+        n_train = int(0.9 * len(tokens))
+        self.tokens = tokens[:n_train] if split == "train" else tokens[n_train:]
+        print(f"Loaded {len(self.tokens)} tokens for split {split}.")
+        assert len(self.tokens) >= B * T * num_processes + 1, (
+            f"{split} split is too small for B * T * world_size = {B * T * num_processes}"
+        )
 
         # state
+        self.reset()
+
+    def reset(self):
         self.current_position = self.B * self.T * self.process_rank
+
+    def state_dict(self):
+        # position relative to this rank's offset, so it's the same on every rank
+        rank_offset = self.B * self.T * self.process_rank
+        return {"shard": 0, "position": self.current_position - rank_offset}
+
+    def load_state_dict(self, state):
+        self.current_position = state["position"] + self.B * self.T * self.process_rank
 
     def next_batch(self):
         B, T = self.B, self.T
@@ -80,6 +111,8 @@ class DataLoaderLite:
 
         self.current_position += B * T * self.num_processes
 
-        if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
-            self.current_position = self.B * self.T * self.process_rank
+        # measured from rank 0's position so that all ranks wrap together
+        rank_0_position = self.current_position - B * T * self.process_rank
+        if rank_0_position + (B * T * self.num_processes + 1) > len(self.tokens):
+            self.reset()
         return x, y

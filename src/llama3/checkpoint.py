@@ -2,6 +2,7 @@ import json
 import os
 
 import torch
+from safetensors.torch import save_model
 
 
 def unwrap(model):
@@ -13,7 +14,7 @@ def unwrap(model):
 
 
 def save_checkpoint(
-    path, model, optimizer, step, val_loss, loader, train_cfg, model_cfg
+    path, model, optimizer, step, best_val, loader, train_cfg, model_cfg
 ):
     """
     call the master process only
@@ -23,9 +24,9 @@ def save_checkpoint(
         "model": raw.state_dict(),
         "optimizer": optimizer.state_dict(),
         "step": step,
-        "val_loss": float(val_loss),
-        # master's position; other ranks re-derive theirs on load
-        "loader_pos": loader.current_position,
+        "best_val": float(best_val),
+        # master's shard and position; other ranks re-derive theirs on load
+        "loader": loader.state_dict(),
         "train_cfg": train_cfg,  # pass asdict(cfg)
         "model_cfg": model_cfg,
         "rng": {
@@ -39,21 +40,34 @@ def save_checkpoint(
     os.replace(tmp, path)
 
 
-def load_checkpoint(path, model, optimizer, loader, device, rank=0):
-    """call on every rank"""
+def load_checkpoint(path, model, loader, device):
+    """
+    call on every rank, returns the checkpoint
+    the optimizer doesn't exist yet at this point, so load ckpt["optimizer"] later
+    """
     ckpt = torch.load(path, map_location=device, weights_only=True)
 
     unwrap(model).load_state_dict(ckpt["model"])
-    if optimizer is not None:
-        optimizer.load_state_dict(ckpt["optimizer"])
-
-    loader.current_position = ckpt["loader_pos"] + loader.B * loader.T * rank
+    loader.load_state_dict(ckpt["loader"])
 
     torch.set_rng_state(ckpt["rng"]["torch"].cpu())
     if ckpt["rng"]["cuda"] is not None and torch.cuda.is_available():
         torch.cuda.set_rng_state(ckpt["rng"]["cuda"].cpu())
 
-    start_step = ckpt["step"] + 1
-    best_val = ckpt["val_loss"]
-    del ckpt
-    return start_step, best_val
+    return ckpt
+
+
+def export_safetensors(ckpt_path, model, export_dir, model_cfg):
+    """
+    call the master process only, overwrites the weights of model with the checkpoint's
+    """
+    raw = unwrap(model)
+    device = next(raw.parameters()).device
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
+    raw.load_state_dict(ckpt["model"])
+
+    os.makedirs(export_dir, exist_ok=True)
+    # save_model rather than save_file, wte and lm_head share a tensor
+    save_model(raw, os.path.join(export_dir, "model.safetensors"))
+    with open(os.path.join(export_dir, "config.json"), "w") as f:
+        json.dump(model_cfg, f, indent=2)
