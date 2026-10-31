@@ -32,3 +32,58 @@ This model has RoPE as apposed the absolute positional encodings:
 Below see the architecture I have implemented (minus the KV cache):
 
 ![LLaMA 3 architecture](figures/llama3.png)
+
+## Results
+
+I trained a 131.8M parameter model on FineWeb-Edu (99 train shards, 1 val shard) for 5,000 steps, or about 2.6B tokens, on 2 GPUs with DDP.
+
+| Metric | Value |
+| --- | --- |
+| Final val loss | 3.2612 |
+| Best val loss | 3.2612 |
+| Median throughput | 876,074 tok/s |
+
+Val loss was still falling when the run ended, so the best value is also the final one.
+
+![Train and val loss over 5,000 steps](figures/Figure_1.png)
+
+The y-axis is cut off at 4.5 to show the later steps; the loss starts at about 11.
+
+### Config
+
+```json
+{
+  "train": {
+    "run_name": "fineweb-llama-132m",
+    "runs_root": "/workspace/runs",
+    "data_path": "/workspace/nanoGPT/edu_fineweb10B",
+    "resume": false,
+    "B": 32,
+    "T": 1024,
+    "total_batch": 524288,
+    "max_lr": 0.0006,
+    "min_lr_ratio": 0.1,
+    "warmup_steps": 200,
+    "max_steps": 5000,
+    "weight_decay": 0.1,
+    "grad_clip": 1.0,
+    "eval_every": 250,
+    "val_steps": 20,
+    "gen_every": 100,
+    "save_every": 500,
+    "seed": 1337,
+    "compile": true
+  },
+  "model": {
+    "vocab_size": 50304,
+    "block_size": 1024,
+    "n_layer": 12,
+    "n_embd": 768,
+    "n_head": 12,
+    "n_groups": 4,
+    "theta": 10000.0,
+    "eps": 1e-05,
+    "sdpa": true
+  }
+}
+```
