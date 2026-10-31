@@ -1,11 +1,13 @@
 # LLaMA 3
 
-A from-scratch Llama 3-style model as per https://arxiv.org/abs/2407.21783
+A from-scratch Llama 3-style model as per <https://arxiv.org/abs/2407.21783>
+
 ## Changes from GPT2
 
 ### RoPE
 
 This model has RoPE as apposed the absolute positional encodings:
+
 - RoPE rotates q and k inside every attention layer by an angle proportional to position, so attnetion scores depend only on the relative offeset $m-n$
 - No position parameters, no position information in the residual stream, and it generalises better beyond the trained length
 
