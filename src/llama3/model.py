@@ -1,4 +1,5 @@
 import math
+import inspect
 
 import torch
 from torch import nn
@@ -219,3 +220,32 @@ class LLaMA3(nn.Module):
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
 
         return logits, loss
+
+    def configure_optimizer(self, weight_decay, learning_rate, device):
+        # start with all of candidate params (that require grad)
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+        # create optim groups. Any 2D params are weight decayed, otherwise no.
+        # tensors in matmuls + embeddings decay, all biases and layer norms dont.
+        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+        nondecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+        optim_groups = [
+            {"params": decay_params, "weight_decay": weight_decay},
+            {"params": nondecay_params, "weight_decay": 0.0},
+        ]
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_nondecay = sum(p.numel() for p in nondecay_params)
+        print(
+            f"number of decayed param tensors {len(decay_params)} with {num_decay_params:,} parameters"
+        )
+        print(
+            f"number of nondecayed param tensors {len(nondecay_params)} with {num_nondecay:,} parameters"
+        )
+        # create AdamW
+        fused_available = "fused" in inspect.signature(torch.optim.AdamW).parameters
+        use_fused = fused_available and "cuda" in device
+        print(f"using fused AdamW: {use_fused}")
+        optimizer = torch.optim.AdamW(
+            optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused
+        )
+        return optimizer
