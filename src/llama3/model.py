@@ -119,18 +119,20 @@ class GroupedQueryAttention(nn.Module):
         k = self.k_proj(x).view(B, T, self.n_groups, self.head_dim).transpose(1, 2)
         v = self.v_proj(x).view(B, T, self.n_groups, self.head_dim).transpose(1, 2)
 
-        # RoPE
+        # RoPE, in q's dtype: the fp32 tables would otherwise promote bf16 q/k
+        # to fp32 under autocast, costing a cast back to bf16 for attention
+        cos, sin = cos.to(q.dtype), sin.to(q.dtype)
         q = apply_rope(q, cos, sin)
         k = apply_rope(k, cos, sin)
 
-        # Expand K and V heads to match Q heads along head dimension
-        # (B, n_groups, T, head_dim) -> (B, n_heads, T, head_dim)
-        k = k.repeat_interleave(self.group_size, dim=1)
-        v = v.repeat_interleave(self.group_size, dim=1)
-
         if self.sdpa:
-            y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+            # SDPA shares each K/V head across its group without copying K/V
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=True)
         else:
+            # Expand K and V heads to match Q heads along head dimension
+            # (B, n_groups, T, head_dim) -> (B, n_heads, T, head_dim)
+            k = k.repeat_interleave(self.group_size, dim=1)
+            v = v.repeat_interleave(self.group_size, dim=1)
             # Scaled dot-product attention
             # (B, n_heads, T, head_dim) @ (B, n_heads, head_dim, T) -> (B, n_heads, T, T)
             scores = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)

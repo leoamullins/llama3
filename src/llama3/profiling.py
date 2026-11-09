@@ -1,6 +1,7 @@
 from pathlib import Path
 
-from torch.profiler import profile, schedule, ProfilerActivity
+import torch
+from torch.profiler import ProfilerActivity, profile, schedule
 
 from llama3.config import LlamaConfig, TrainConfig, parse_configs
 from llama3.data import DataLoaderLite
@@ -25,10 +26,17 @@ class ProfilingTrainer(Trainer):
 train_cfg, model_cfg = parse_configs(TrainConfig, LlamaConfig)
 trainer = ProfilingTrainer(train_cfg, model_cfg)
 
-# warmup outside profiler
+# warmup outside profiler (also triggers torch.compile when --compile is set)
 for s in range(3):
     trainer._train_step(s)
 
+# timed steps without the profiler, whose overhead would skew the numbers
+torch.cuda.reset_peak_memory_stats()
+timed = [trainer._train_step(s) for s in range(10)]
+dt = sum(m["dt_ms"] for m in timed) / len(timed)
+tok_s = sum(m["tokens_per_sec"] for m in timed) / len(timed)
+peak_gb = torch.cuda.max_memory_allocated() / 1e9
+print(f"[bench] {train_cfg.run_name}: {dt:.1f} ms/step, {tok_s:,.0f} tok/s, peak {peak_gb:.1f} GB")
 
 with profile(
     activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
@@ -42,4 +50,4 @@ with profile(
         prof.step()
 
 print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=25))
-prof.export_chrome_trace("trace.json")
+prof.export_chrome_trace(f"trace_{train_cfg.run_name}.json")
