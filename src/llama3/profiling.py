@@ -1,10 +1,29 @@
+from pathlib import Path
+
 from torch.profiler import profile, schedule, ProfilerActivity
 
 from llama3.config import LlamaConfig, TrainConfig, parse_configs
+from llama3.data import DataLoaderLite
 from llama3.train import Trainer
 
+# profile on the small text file in the repo, so no FineWeb shards are needed
+INPUT_TXT = Path(__file__).resolve().parents[2] / "data" / "input.txt"
+
+
+class ProfilingTrainer(Trainer):
+    def build_loader(self, split):
+        return DataLoaderLite(
+            B=self.cfg.B,
+            T=self.cfg.T,
+            process_rank=self.rank,
+            num_processes=self.world_size,
+            data_path=str(INPUT_TXT),
+            split=split,
+        )
+
+
 train_cfg, model_cfg = parse_configs(TrainConfig, LlamaConfig)
-trainer = Trainer(train_cfg, model_cfg)
+trainer = ProfilingTrainer(train_cfg, model_cfg)
 
 # warmup outside profiler
 for s in range(3):
