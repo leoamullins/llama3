@@ -15,6 +15,8 @@ with profile(
     activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
     schedule=schedule(wait=1, warmup=2, active=5),
     record_shapes=True,
+    profile_memory=True,
+    with_stack=True,
 ) as prof:
     for s in range(8):
         trainer._train_step(s)
