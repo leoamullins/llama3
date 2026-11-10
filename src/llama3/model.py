@@ -5,6 +5,16 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+try:
+    from llama3.kernels.swiglu import swiglu as triton_swiglu
+except ImportError:
+    triton_swiglu = None
+
+try:
+    from llama3.kernels.fused_ce import fused_linear_cross_entropy
+except ImportError:
+    fused_linear_cross_entropy = None
+
 # --------------------------------------------------------------
 # CREATING LLaMA 3 Model Architecture (Meta LLaMA)
 # --------------------------------------------------------------
@@ -51,12 +61,13 @@ class SwiGLU(nn.Module):
         self.w3._is_residual = True
 
     def forward(self, x):
-        # first linear projection for the gate, activated by SiLU
-        gate = F.silu(self.w1(x))
-        # second linear projected
-        data = self.w2(x)
-        # element wise multiplicated, followed by final projection
-        return self.w3(gate * data)
+        a = self.w1(x)
+        b = self.w2(x)
+        if triton_swiglu is not None and a.is_cuda:
+            h = triton_swiglu(a,b)
+        else:
+            h = F.silu(a) * b
+        return self.w3(h)
 
 
 class RMSNorm(nn.Module):
@@ -220,6 +231,10 @@ class LLaMA3(nn.Module):
             x = block(x, cos, sin)
 
         x = self.transformer.rms_f(x)
+
+        if targets is not None and fused_linear_cross_entropy is not None and x.is_cuda:
+            loss = fused_linear_cross_entropy(x, self.lm_head.weight, targets)
+            return None, loss
         # (B, T, n_embd) -> (B, T, vocab_size)
         logits = self.lm_head(x)
         loss = None
