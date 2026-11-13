@@ -50,4 +50,7 @@ with profile(
         prof.step()
 
 print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=25))
-prof.export_chrome_trace(f"trace_{train_cfg.run_name}.json")
+trace_path = Path(train_cfg.run_dir) / f"trace_{train_cfg.run_name}.json"
+trace_path.parent.mkdir(parents=True, exist_ok=True)
+prof.export_chrome_trace(str(trace_path))
+print(f"[trace] wrote {trace_path}")

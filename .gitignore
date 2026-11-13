@@ -2,3 +2,6 @@ __pycache__/
 *.py[cod]
 .venv/
 /runs
+# profiler traces (hundreds of MB) and local benchmark runner
+trace_*.json
+scripts/bench_all.sh
