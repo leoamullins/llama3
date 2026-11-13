@@ -33,6 +33,9 @@ class TrainConfig:
     # misc
     seed: int = 1337
     compile: bool = False
+    precision: str = "bf16"
+    fused_adamw: bool = True
+    save: bool = True
 
     @property
     def run_dir(self):

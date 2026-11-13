@@ -1,5 +1,42 @@
 # Kernel benchmarks
 
+## Cumulative ablation: RTX 4090, 2026-11-13
+
+Start from FP32 eager and add one optimisation at a time. Each config is a real 500-step training run:
+- `B=8, T=1024`, 65,536 tokens/step (8 grad-accum micro-steps), ~33M tokens of FineWeb-Edu
+- 50 warmup steps, eval every 25 steps (20 val batches), seed 1337
+- torch 2.15.0+cu132, Triton 3.9.0, commit `1d1502f` + the ablation flags (`--precision`, `--fused_adamw`, `--save`)
+
+Script: `ablation.sh` (not committed). ms/step and tok/s are medians over steps ≥10, excluding eval steps.
+Peak memory is `torch.cuda.max_memory_allocated`.
+
+| Run | Adds | ms/step | tok/s | vs C0 | Step gain | Peak mem | Final val | Δ val vs C0 |
+|---|---|---|---|---|---|---|---|---|
+| c0_fp32 | baseline (fp32, manual attn, for-loop AdamW) | 2621 | 25.0k | 1.00× | — | 20.30 GB | 5.268 | — |
+| c1_tf32 | TF32 matmuls | 2175 | 30.1k | 1.20× | +20% | 20.30 GB | 5.242 | −0.026 |
+| c2_bf16 | bf16 autocast | 1654 | 39.6k | 1.58× | +32% | 18.77 GB | 5.242 | −0.026 |
+| c3_sdpa | SDPA attention | 701 | 93.4k | 3.74× | **+136%** | 11.31 GB | 5.236 | −0.032 |
+| c4_fused_adamw | fused AdamW | 697 | 94.0k | 3.76× | +0.6% | 11.31 GB | 5.238 | −0.030 |
+| c5_triton | Triton SwiGLU + RMSNorm | 669 | 97.9k | 3.92× | +4.2% | 10.78 GB | 5.240 | −0.028 |
+| c6_fused_ce | fused linear cross-entropy | 638 | 102.8k | 4.11× | +5.0% | **6.37 GB** | 5.248 | −0.020 |
+| c7_compile | `torch.compile` | **566** | **115.9k** | **4.64×** | +12.8% | 6.09 GB | 5.243 | −0.025 |
+| c0_fp32_seed2 | C0, `--seed 2` (noise floor) | 2621 | 25.0k | — | — | 20.30 GB | 5.243 | −0.025 |
+
+**Stability:** all 9 runs had 0 non-finite losses or grad norms. None had a loss spike (train loss > 1.5× the rolling
+median of the previous 20 steps). Grad norm divided by C0's at the same step has a median of 1.000–1.008 for every config.
+The largest per-step outlier is 1.6×, against 3.6× between the two C0 seeds.
+
+**Takeaways**
+- **Quality is unchanged.** Every config ends within 0.032 val loss of C0. Changing only the seed moves it by 0.025 at
+  the end, and by up to 0.061 at earlier evals. C0 itself is the slight outlier: any numerical change, such as fp32 → tf32,
+  sends training down a different path, the same way a new seed does.
+- **SDPA is the biggest win** (2.4× on its own; 18.8 → 11.3 GB). The manual path stores every T×T attention matrix.
+- **Fused CE is the biggest memory win after SDPA** (10.8 → 6.4 GB) because the `B·T×V` logits are never stored.
+- **Compile still adds 12.8%** on top of the Triton kernels. The profiler, though, showed `_rmsnorm_fwd` and
+  `_ce_rows_kernel` running slower under compile. The leave-one-out runs (`--compile --no-triton_*`) are the next check.
+- **Fused AdamW is ~0.6%** because the optimizer step runs once per 8 micro-steps.
+- **The overall result is 4.64× the throughput with 70% less memory**, at the same loss.
+
 ## RTX 4090 — 2026-11-13
 
 Setup: 124M-param LLaMA-3 config (12 layers, d=768), `B=8, T=1024`, bf16 autocast, `data/input.txt`.

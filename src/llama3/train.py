@@ -29,6 +29,7 @@ CSV_FIELDS = [
     "grad_norm",
     "dt_ms",
     "tokens_per_sec",
+    "peak_mem_gb"
 ]
 
 
@@ -43,7 +44,11 @@ class Trainer:
         torch.manual_seed(self.cfg.seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed(self.cfg.seed)
-        torch.set_float32_matmul_precision("high")
+
+        assert self.cfg.precision in ("fp32", "tf32", "bf16"), self.cfg.precision
+        torch.set_float32_matmul_precision(
+            "highest" if self.cfg.precision == "fp32" else "high"
+        )
 
         self._setup_batch_sizes()
         self.train_loader = self.build_loader("train")
@@ -55,6 +60,7 @@ class Trainer:
         self._write_config()
         self._open_log()
 
+        
     # ----------------------------------------------------------
     # setup
     def _setup_distributed(self):
@@ -131,6 +137,7 @@ class Trainer:
             weight_decay=self.cfg.weight_decay,
             learning_rate=self.cfg.max_lr,
             device=self.device,
+            fused=self.cfg.fused_adamw
         )
         if self._resume_ckpt is not None:
             self.optimizer.load_state_dict(self._resume_ckpt["optimizer"])
@@ -177,6 +184,8 @@ class Trainer:
         return self.cfg.min_lr + coeff * (self.cfg.max_lr - self.cfg.min_lr)
 
     def _autocast(self):
+        if self.cfg.precision != "bf16":
+            return nullcontext()
         return torch.amp.autocast(device_type=self.device_type, dtype=torch.bfloat16)
 
     def _all_reduce(self, tensor):
@@ -226,6 +235,7 @@ class Trainer:
             "grad_norm": norm.item(),
             "dt_ms": dt * 1000,
             "tokens_per_sec": tokens_processed / dt,
+            "peak_mem_gb": (torch.cuda.max_memory_allocated() / 1e9 if self.device_type == "cuda" else 0.0),
         }
 
     # ----------------------------------------------------------
@@ -246,6 +256,8 @@ class Trainer:
         return loss_accum.item()
 
     def _save(self, path, step):
+        if not self.cfg.save:
+            return 
         if self.master_process:
             save_checkpoint(
                 path,

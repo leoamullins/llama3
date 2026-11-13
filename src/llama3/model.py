@@ -259,7 +259,7 @@ class LLaMA3(nn.Module):
 
         return logits, loss
 
-    def configure_optimizer(self, weight_decay, learning_rate, device):
+    def configure_optimizer(self, weight_decay, learning_rate, device, fused=True):
         # start with all of candidate params (that require grad)
         param_dict = {pn: p for pn, p in self.named_parameters()}
         param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
@@ -281,7 +281,7 @@ class LLaMA3(nn.Module):
         )
         # create AdamW
         fused_available = "fused" in inspect.signature(torch.optim.AdamW).parameters
-        use_fused = fused_available and "cuda" in device
+        use_fused = fused and fused_available and "cuda" in device
         print(f"using fused AdamW: {use_fused}")
         optimizer = torch.optim.AdamW(
             optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused

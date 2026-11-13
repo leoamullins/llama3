@@ -5,3 +5,6 @@ __pycache__/
 # profiler traces (hundreds of MB) and local benchmark runner
 trace_*.json
 scripts/bench_all.sh
+notes/ablation-plan.md
+ablation.sh
+ablation.out
