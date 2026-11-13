@@ -73,7 +73,7 @@ def _rmsnorm_bwd(
 
 class RMSNormFunction(torch.autograd.Function):
     @staticmethod
-    def foward(ctx, x, w, eps):
+    def forward(ctx, x, w, eps):
         # B, T, D
         shape = x.shape
 
@@ -83,7 +83,7 @@ class RMSNormFunction(torch.autograd.Function):
 
         y = torch.empty_like(x2d)  # smae stride as x2d
 
-        rstd = torch.empty(N, dtype=torch.float32)
+        rstd = torch.empty(N, dtype=torch.float32, device=x.device)
 
         BLOCK_D = triton.next_power_of_2(D)
         _rmsnorm_fwd[(N,)](
@@ -103,9 +103,9 @@ class RMSNormFunction(torch.autograd.Function):
         dy2d = dy.reshape(-1, D).contiguous()
         dx = torch.empty_like(dy2d)
 
-        n_programs = torch.cuda.get_device_properties(x2d.device).multi_process_count
-        rows_per_program = torch.cdiv(N, n_programs)
-        dw_partial = torch.empty((n_programs, D), dtype=torch.float32)
+        n_programs = torch.cuda.get_device_properties(x2d.device).multi_processor_count
+        rows_per_program = triton.cdiv(N, n_programs)
+        dw_partial = torch.empty((n_programs, D), dtype=torch.float32, device=x2d.device)
 
         _rmsnorm_bwd[(n_programs,)](
             dy2d,
@@ -125,11 +125,5 @@ class RMSNormFunction(torch.autograd.Function):
         return dx.view(ctx.shape), dw, None
 
 
-class TritonRMSNorm(torch.nn.Module):
-    def __init__(self, dim, eps=1e-5):
-        super().__init__()
-        self.eps = eps
-        self.weight = torch.nn.Parameter(torch.ones(dim))
-
-    def forward(self, x):
-        return RMSNormFunction.apply(x, self.weight, self.eps)
+def rms_norm(x, weight, eps=1e-5):
+    return RMSNormFunction.apply(x, weight, eps)

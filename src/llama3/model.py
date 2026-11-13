@@ -15,6 +15,11 @@ try:
 except ImportError:
     fused_linear_cross_entropy = None
 
+try:
+    from llama3.kernels.rmsnorm import rms_norm as triton_rms_norm
+except ImportError:
+    triton_rms_norm = None
+
 # --------------------------------------------------------------
 # CREATING LLaMA 3 Model Architecture (Meta LLaMA)
 # --------------------------------------------------------------
@@ -52,9 +57,10 @@ class SwiGLU(nn.Module):
     SWiGLU implementation, SwiGLU(x) = (xW2) * SiLU(xW1)
     """
 
-    def __init__(self, d_model, hidden_dim):
+    def __init__(self, d_model, hidden_dim, use_triton=True):
         super().__init__()
 
+        self.use_triton = use_triton
         self.w1 = nn.Linear(d_model, hidden_dim, bias=False)
         self.w2 = nn.Linear(d_model, hidden_dim, bias=False)
         self.w3 = nn.Linear(hidden_dim, d_model, bias=False)
@@ -63,7 +69,7 @@ class SwiGLU(nn.Module):
     def forward(self, x):
         a = self.w1(x)
         b = self.w2(x)
-        if triton_swiglu is not None and a.is_cuda:
+        if self.use_triton and triton_swiglu is not None and a.is_cuda:
             h = triton_swiglu(a,b)
         else:
             h = F.silu(a) * b
@@ -74,9 +80,12 @@ class RMSNorm(nn.Module):
     def __init__(self, config):
         super().__init__()
 
+        self.use_triton = config.triton_rmsnorm
         self.rmsnorm = nn.RMSNorm(normalized_shape=(config.n_embd,), eps=config.eps)
 
     def forward(self, x):
+        if self.use_triton and triton_rms_norm is not None and x.is_cuda:
+            return triton_rms_norm(x, self.rmsnorm.weight, self.rmsnorm.eps)
         return self.rmsnorm(x)
 
 
@@ -88,7 +97,9 @@ class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
 
-        self.swiglu = SwiGLU(config.n_embd, int(3.5 * config.n_embd))
+        self.swiglu = SwiGLU(
+            config.n_embd, int(3.5 * config.n_embd), use_triton=config.triton_swiglu
+        )
 
     def forward(self, x):
         return self.swiglu(x)
@@ -232,7 +243,12 @@ class LLaMA3(nn.Module):
 
         x = self.transformer.rms_f(x)
 
-        if targets is not None and fused_linear_cross_entropy is not None and x.is_cuda:
+        if (
+            self.config.fused_ce
+            and targets is not None
+            and fused_linear_cross_entropy is not None
+            and x.is_cuda
+        ):
             loss = fused_linear_cross_entropy(x, self.lm_head.weight, targets)
             return None, loss
         # (B, T, n_embd) -> (B, T, vocab_size)

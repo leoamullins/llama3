@@ -66,6 +66,10 @@ class LlamaConfig:
     theta: float = 10_000.0  # RoPE base
     eps: float = 1e-5  # RMSNorm epsilon
     sdpa: bool = True  # F.scaled_dot_product_attention; --no-sdpa for the manual path
+    # Triton kernels (each falls back to PyTorch when off, or when not on CUDA)
+    triton_swiglu: bool = True  # --no-triton_swiglu for F.silu(a) * b
+    triton_rmsnorm: bool = True  # --no-triton_rmsnorm for nn.RMSNorm
+    fused_ce: bool = True  # --no-fused_ce for lm_head + F.cross_entropy
 
 
 def parse_configs(*classes):
